@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { extractCapturedPatch } from '../src/background/autoCapture';
 import {
   geminiWebProvider,
+  extractGeminiUsageFromHtml,
   parseGeminiWebQuota,
   stripGoogleXssiPrefix,
 } from '../src/providers/geminiWeb';
@@ -46,6 +47,37 @@ const SAMPLE_GEMINI_RESPONSE = [
   },
 ];
 
+const SAMPLE_USAGE_HTML = `<html><script nonce="test" type="application/json" data-bg3-relay-preload>${JSON.stringify({
+  events: [{ id: 'usage:0', kind: 'chunk', chunk: JSON.stringify(SAMPLE_GEMINI_RESPONSE) }],
+})}</script></html>`;
+
+describe('extractGeminiUsageFromHtml', () => {
+  it('decodes the usage data from the page preload', () => {
+    expect(extractGeminiUsageFromHtml(SAMPLE_USAGE_HTML)).toEqual(SAMPLE_GEMINI_RESPONSE);
+  });
+
+  it('skips malformed and unrelated events before the usage chunk', () => {
+    const unrelated = `<script type="application/json" data-bg3-relay-preload>${JSON.stringify({
+      events: [{ id: 'broken', kind: 'chunk', chunk: '{broken' }, { id: 'other', kind: 'chunk', chunk: '[{"data":{}}]' }],
+    })}</script>`;
+    expect(extractGeminiUsageFromHtml(unrelated + SAMPLE_USAGE_HTML)).toEqual(SAMPLE_GEMINI_RESPONSE);
+  });
+
+  it('reassembles streamed chunks across scripts without mixing event IDs', () => {
+    const raw = JSON.stringify(SAMPLE_GEMINI_RESPONSE);
+    const pieces = [raw.slice(0, 50), raw.slice(50, -1), raw.slice(-1)];
+    const html = pieces.map(chunk => `<script type="application/json" data-bg3-relay-preload>${JSON.stringify({
+      events: [{ id: 'usage:0', kind: 'chunk', chunk }, { id: 'other:0', kind: 'chunk', chunk: 'unrelated' }],
+    })}</script>`).join('');
+    expect(extractGeminiUsageFromHtml(html)).toEqual(SAMPLE_GEMINI_RESPONSE);
+  });
+
+  it('ignores executable scripts and pages without usage data', () => {
+    expect(extractGeminiUsageFromHtml('<script>throw new Error("never execute")</script>')).toBeUndefined();
+    expect(extractGeminiUsageFromHtml('<html>Sign in</html>')).toBeUndefined();
+  });
+});
+
 describe('stripGoogleXssiPrefix', () => {
   it("strips )]}' prefix before JSON", () => {
     const cleaned = stripGoogleXssiPrefix(")]}'\n[{\"ok\":true}]");
@@ -84,19 +116,21 @@ describe('geminiWebProvider.fetchUsage', () => {
     { querySignature: '', extHeaderBin: '' },
     { querySignature: 'mock-query-signature=', extHeaderBin: '' },
     { querySignature: '', extHeaderBin: 'mock-client-header' },
-  ])('guides parameter capture without sending an incomplete request: %j', async (geminiWeb) => {
-    const fetchFn = vi.fn();
+  ])('queries the signed-in usage page without captured parameters: %j', async (geminiWeb) => {
+    const fetchFn = vi.fn(async () => new Response(SAMPLE_USAGE_HTML));
     const res = await geminiWebProvider.fetchUsage({ ...DEFAULT_SETTINGS, geminiWeb }, {
       fetchFn,
       nowMs: () => 123,
     });
 
-    expect(res.status).toBe('unauthenticated');
-    expect(res.metrics).toEqual([]);
-    expect(res.loginUrl).toBe('https://gemini.google.com');
-    expect(res.errorMessage).toContain('自动获取参数');
+    expect(res.status).toBe('ok');
+    expect(res.metrics).toHaveLength(2);
     expect(res.updatedAt).toBe(123);
-    expect(fetchFn).not.toHaveBeenCalled();
+    expect(fetchFn).toHaveBeenCalledOnce();
+    const [url, options] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://gemini.google.com/usage');
+    expect(options.credentials).toBe('include');
+    expect(options.cache).toBe('no-store');
   });
 
   it('queries usage using parameters captured from a browser request with initially empty settings', async () => {
@@ -117,8 +151,8 @@ describe('geminiWebProvider.fetchUsage', () => {
     const res = await geminiWebProvider.fetchUsage(settings, { fetchFn });
 
     expect(res.status).toBe('ok');
-    expect(fetchFn).toHaveBeenCalledOnce();
-    const [url, options] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    const [url, options] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
     expect(new URL(url).searchParams.get('query_signature')).toBe('mock-query-signature=');
     expect(options.credentials).toBe('include');
     expect(new Headers(options.headers).get('x-goog-ext-525001261-bin')).toBe('mock-client-header');
@@ -138,5 +172,29 @@ describe('geminiWebProvider.fetchUsage', () => {
       fetchFn: async () => new Response('Forbidden', { status: 403 }),
     });
     expect(res.status).toBe('unauthenticated');
+  });
+
+  it('recognizes a Google login redirect without using old query parameters', async () => {
+    const response = new Response('<html>Sign in</html>');
+    Object.defineProperty(response, 'url', { value: 'https://accounts.google.com/signin' });
+    const fetchFn = vi.fn(async () => response);
+    const res = await geminiWebProvider.fetchUsage(CONFIGURED_SETTINGS, { fetchFn });
+    expect(res.status).toBe('unauthenticated');
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it('reports missing page data as an error rather than an expired login', async () => {
+    const fetchFn = vi.fn(async () => new Response('<html>Changed format</html>'));
+    const res = await geminiWebProvider.fetchUsage(DEFAULT_SETTINGS, { fetchFn });
+    expect(res.status).toBe('error');
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it('reports HTTP errors from the page when no fallback is available', async () => {
+    const res = await geminiWebProvider.fetchUsage(DEFAULT_SETTINGS, {
+      fetchFn: async () => new Response('Unavailable', { status: 503 }),
+    });
+    expect(res.status).toBe('error');
+    expect(res.errorMessage).toContain('503');
   });
 });

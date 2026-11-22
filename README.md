@@ -10,7 +10,7 @@
 - **即开即用与后台刷新**：打开 Popup 时优先展示本地缓存快照，同时静默拉取最新实时数据；支持全部刷新与单渠道独立刷新。
 - **支持渠道**：
   - **Antigravity**：基于浏览器登录态 Cookie（`SAPISIDHASH` 鉴权）拉取 `GetUserQuotaSummary`，从官方客户端自动发现查询 API Key，按模型分组展示 5 小时窗口与周窗口配额，无需手动填写 Key。
-  - **Gemini Web**：基于浏览器登录态拉取 `GEMINI_WEB_GRAPHQL` 用量信息，展示订阅等级与 5 小时 / 周窗口配额池使用率。
+  - **Gemini Web**：基于浏览器登录态读取用量页面内嵌的配额信息，展示订阅等级与 5 小时 / 周窗口配额池使用率，已捕获的 `GEMINI_WEB_GRAPHQL` 参数作为备用。
   - **腾讯云 TokenHub**：使用 TC3-HMAC-SHA256 签名直连 `DescribeTokenPlanPersonalPackage` 接口，支持 `TokenPlan 个人版`（`personal`）与 `TokenPlan 个人版 · 混元`（`personal-hunyuan`），并在设置页提供凭据连通性测试。
   - **鹅厂 Token**：复用浏览器 OA 登录态，优先在后台获取首页中的临时 `X-Page-Token` 并直接调用 `query-quota?platform=all`，无需打开看板网页。后台会话不可用时才在已登录标签页内查询；没有可用标签页时通过临时后台标签页恢复查询并自动关闭。展示本月全部产品的费用额度使用百分比及人民币已用/剩余额度。百分比使用看板的 `personal.usage_rate`，不是原始 Token 数量占比；接口未提供重置时间时不展示倒计时。
 - **参数自动捕获（Auto-Capture）**：后台 Service Worker 会监听正常标签页对 Antigravity 与 Gemini Web 的请求，自动同步 `authUser`、`apiKey`、`querySignature`、`x-goog-ext-525001261-bin` 等动态参数，减少手动配置成本。
@@ -54,7 +54,7 @@ npm run dev
 ## 使用说明
 
 - **Antigravity**：确保已在当前浏览器中登录对应网页版账号；若提示未认证或参数过期，访问一次对应网页触发请求后，扩展会自动捕获最新请求参数。
-- **Gemini Web**：查询签名和客户端请求头默认留空，不内置固定值。安装扩展后，请在当前浏览器登录 Gemini，并打开或刷新其用量页面触发用量请求；扩展自动捕获参数后，刷新面板即可查询。缺少参数时会显示引导提示，已捕获的参数仅保存在本地浏览器中。
+- **Gemini Web**：在当前浏览器登录 Gemini 后，打开或刷新扩展即可查询用量，无需手动点击“用量限额”。扩展后台读取 `/usage` 页面内嵌的配额数据，不打开标签页。此前自动捕获的查询参数仍保存在本地，用作页面格式变化时的备用查询方式。
 - **腾讯云 TokenHub**：点击面板右上角设置图标，填入腾讯云 `SecretId`、`SecretKey`、地域（默认 `ap-guangzhou`）并勾选需要查询的套餐类型，可点击测试按钮验证配置后保存。
 - **鹅厂 Token**：在当前浏览器打开 `https://token.woa.com/` 完成 OA 登录后，刷新扩展即可查看，无需填写 API Key。该渠道默认开启，也可在设置中关闭或调整顺序。登录过期时提供登录入口；无限额度或额度隐藏时提示无法计算百分比。
 - **升级现有扩展**：构建后在扩展管理页重新加载 `dist/`，并允许扩展访问 `token.woa.com` 和 `www.gstatic.com`。新增 `scripting` 权限用于在看板页面内查询，Google 官方静态资源权限用于自动获取 Antigravity 查询参数。

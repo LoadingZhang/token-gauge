@@ -5,6 +5,7 @@ import { ChannelProvider, ProviderDeps } from './types';
 const GEMINI_BASE_URL =
   'https://gemini.google.com/_/BardChatUi/graphql/schemas/GEMINI_WEB_GRAPHQL/executeQuery';
 const GEMINI_ORIGIN = 'https://gemini.google.com';
+const GEMINI_USAGE_URL = `${GEMINI_ORIGIN}/usage`;
 
 const GEMINI_VARIABLES = JSON.stringify({
   g1Request: {
@@ -74,6 +75,35 @@ function findUsageInfo(payload: unknown): GeminiUsageInfo | undefined {
     const getUsageInfo = (rpcs as Record<string, unknown>).getUsageInfo;
     if (getUsageInfo && typeof getUsageInfo === 'object') {
       return getUsageInfo as GeminiUsageInfo;
+    }
+  }
+  return undefined;
+}
+
+// The usage page embeds the same GraphQL data for its initial render.
+// Decode only JSON preload chunks; never execute scripts from the page.
+export function extractGeminiUsageFromHtml(html: string): unknown | undefined {
+  const chunksById = new Map<string, string>();
+  for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
+    if (!/\bdata-bg3-relay-preload(?:\s|=|$)/i.test(match[1]) ||
+        !/\btype\s*=\s*(["'])application\/json\1/i.test(match[1])) continue;
+    try {
+      const preload = JSON.parse(match[2]) as { events?: Array<{ id?: string; kind?: string; chunk?: unknown }> };
+      if (!Array.isArray(preload?.events)) continue;
+      for (const event of preload.events) {
+        if (event?.kind !== 'chunk' || typeof event.chunk !== 'string') continue;
+        const id = event.id ?? '';
+        const combined = (chunksById.get(id) ?? '') + event.chunk;
+        chunksById.set(id, combined);
+        try {
+          const payload: unknown = JSON.parse(combined);
+          if (findUsageInfo(payload)) return payload;
+        } catch {
+          // Other preload events may contain incomplete or unrelated chunks.
+        }
+      }
+    } catch {
+      // Ignore malformed preloads and continue looking for the usage data.
     }
   }
   return undefined;
@@ -153,7 +183,7 @@ export function buildGeminiRequestUrl(querySignature: string): string {
 export const geminiWebProvider: ChannelProvider = {
   id: 'gemini-web',
   name: 'Gemini Web',
-  description: '通过浏览器 Google Cookie 调用 GEMINI_WEB_GRAPHQL',
+  description: '通过浏览器 Google Cookie 读取 Gemini 用量页面',
   authType: 'cookie',
 
   async fetchUsage(
@@ -163,16 +193,35 @@ export const geminiWebProvider: ChannelProvider = {
     const fetchFn = deps.fetchFn ?? fetch;
     const now = (deps.nowMs ?? Date.now)();
 
+    const baseResult = {
+      channelId: 'gemini-web', channelName: 'Gemini Web', metrics: [],
+      loginUrl: GEMINI_ORIGIN, updatedAt: now,
+    };
+
+    let pageError = '无法从 Gemini 页面读取用量信息，请确认已在当前浏览器登录 Gemini 后重试。';
+    try {
+      const page = await fetchFn(GEMINI_USAGE_URL, {
+        credentials: 'include', cache: 'no-store', signal: AbortSignal.timeout(15_000),
+      });
+      if (page.status === 401 || page.status === 403 || page.url?.includes('accounts.google.com')) {
+        return {
+          ...baseResult, status: 'unauthenticated',
+          errorMessage: 'Gemini Web 未登录或会话已过期，请先在当前浏览器打开 gemini.google.com 登录。',
+        };
+      }
+      if (page.ok) {
+        const payload = extractGeminiUsageFromHtml(await page.text());
+        if (payload !== undefined) return parseGeminiWebQuota(payload, now);
+      } else {
+        pageError = `Gemini 用量页面请求失败 (${page.status})，请稍后刷新重试。`;
+      }
+    } catch (error) {
+      pageError = error instanceof Error ? `Gemini 用量页面请求失败：${error.message}` : pageError;
+    }
+
+    // Retain captured GraphQL parameters as a fallback for page format changes.
     if (!settings.geminiWeb.querySignature || !settings.geminiWeb.extHeaderBin) {
-      return {
-        channelId: 'gemini-web',
-        channelName: 'Gemini Web',
-        status: 'unauthenticated',
-        metrics: [],
-        loginUrl: GEMINI_ORIGIN,
-        errorMessage: '尚未获取 Gemini Web 用量查询参数，请在当前浏览器打开或刷新 gemini.google.com 的用量页面，待扩展自动获取参数后再刷新。',
-        updatedAt: now,
-      };
+      return { ...baseResult, status: 'error', errorMessage: pageError };
     }
 
     const url = buildGeminiRequestUrl(settings.geminiWeb.querySignature);
@@ -185,6 +234,7 @@ export const geminiWebProvider: ChannelProvider = {
           accept: 'application/json',
           'x-goog-ext-525001261-bin': settings.geminiWeb.extHeaderBin,
         },
+        signal: AbortSignal.timeout(15_000),
       });
 
       if (
